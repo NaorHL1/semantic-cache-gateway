@@ -55,7 +55,7 @@ HNSW is approximate: with `EF_RUNTIME=10` it can occasionally miss the true near
 
 ### 6. Mitigation & Reversibility
 * **Encapsulation via Interface Contract:** Direct Redis calls never leak into the FastAPI routing layer. The original `check_similarity(vector, threshold)` contract has no tenant or scope parameters and is **superseded by the `BaseVectorCache` interface in ADR-0004 §6** (`get_exact`, `search_similar`, `store`).
-* **Client library path:** use `redisvl.extensions.cache.llm` (or the lower-level `redisvl.index.SearchIndex`). Importing from `redisvl.extensions.llmcache` is deprecated [4].
+* **Client library path:** use the lower-level `redisvl.index.SearchIndex` and `redisvl.query.VectorQuery`. ADR-0004 §4 rules out the high-level `SemanticCache` (`redisvl.extensions.cache.llm`) because it has no exact layer and no tenant or scope filtering. If it is ever used, import it from `redisvl.extensions.cache.llm`; `redisvl.extensions.llmcache` is deprecated [4].
 * **Open decision: persistence (Type 2).** A cache can run without persistence (`save ""`, `appendonly no`). That removes `BGSAVE` memory spikes and disk I/O, at the cost of an empty cache after a restart. To be decided; the default Redis configuration keeps RDB snapshots.
 * **Reversibility (Type 2 Decision):** Valkey and Dragonfly speak the same RESP protocol, but their search commands are not verified against `redisvl`. Migrating means implementing a new `BaseVectorCache` adapter and validating it against the ADR-0004 test suite, with zero changes to gateway logic or routing endpoints.
 

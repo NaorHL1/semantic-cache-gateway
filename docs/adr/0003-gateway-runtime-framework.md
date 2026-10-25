@@ -69,19 +69,19 @@ Gateway throughput is therefore set by upstream latency (misses) and embedding C
 
 ### 6. Mitigation & Reversibility
 * **Thread Offloading for CPU Tasks:** All FastEmbed calls run via `asyncio.to_thread` (ADR-0002 §6). The load test above shows this is required for correctness of the latency SLA, not just for throughput.
-* **Streaming Interceptor:** Upstream SSE is teed by `StreamInterceptor` (`src/gateway/stream_interceptor.py`). Its storage rules are defined in **ADR-0004 §4.7–4.8**:
+* **Streaming Interceptor:** Upstream SSE will be teed by `StreamInterceptor` (planned: `src/gateway/stream_interceptor.py`). Its storage rules are defined in **ADR-0004 §4.7–4.8**:
   * Forward bytes immediately, buffering partial SSE events across TCP chunks.
   * Store only after `data: [DONE]` with `finish_reason == "stop"`, no refusal, no tool calls, and recorded usage.
   * Close upstream and store nothing on client disconnect or upstream error.
   * Write to the cache as a background task, never inline.
   
-  These behaviors are covered by `tests/test_stream_interceptor.py` (12 cases).
+  Each of these behaviors must be covered by `tests/test_stream_interceptor.py` (planned, implementation phase).
 * **Open dependency:** The upstream HTTP client (library, connection pool, timeouts, retries) is not decided here and will be covered by ADR-0005. Note that the OpenAI Python SDK's default transport (httpx/httpcore) has a documented connection-pool scaling problem at high concurrency [3].
 * **Reversibility (Type 2 Decision):** The gateway is a standard ASGI app (`app = FastAPI()`), so the server can be swapped with one command (`granian --interface asgi src.main:app` ↔ `uvicorn src.main:app`) without changing application code.
 
 ### 7. References & Benchmarks
 1. **Granian benchmarks: comparison with other servers.** Run 2026-08-05. [github.com/emmett-framework/granian/blob/master/benchmarks/vs.md](https://github.com/emmett-framework/granian/blob/master/benchmarks/vs.md)
-2. **Local gateway-shaped load test.** `benchmarks/server_load/` (`app.py`, `load.py`). Uvicorn 0.53, Python 3.13, 2 CPUs, 6.6ms single-threaded NumPy workload standing in for one embedding.
+2. **Local gateway-shaped load test.** Scripts to be committed under `benchmarks/server_load/` (`app.py`, `load.py`). Uvicorn 0.53, Python 3.13, 2 CPUs, 6.6ms single-threaded NumPy workload standing in for one embedding.
 3. **NVIDIA NeMo Gym.** *Engineering notes: aiohttp vs httpx* (httpcore connection pool is O(n²); a 16,000-request rollout hung for 40 minutes). [docs.nvidia.com/nemo/gym](https://docs.nvidia.com/nemo/gym/infrastructure/engineering-notes/aiohttp-vs-httpx)
 4. **FastAPI documentation.** [fastapi.tiangolo.com](https://fastapi.tiangolo.com)
 5. **Granian.** [github.com/emmett-framework/granian](https://github.com/emmett-framework/granian)

@@ -7,7 +7,7 @@
 ---
 
 ### 1. Context & Problem Statement
-ADR-0001 to ADR-0003 fixed the storage engine (Redis Stack), the embedding model (`all-MiniLM-L12-v2`, 384-dim) and the runtime (FastAPI + Granian). This ADR defines the algorithm that sits on top of them: for every `POST /v1/chat/completions` request, the gateway must decide whether it may answer from the cache, which stored entry it may use, and what it may store afterwards.
+ADR-0001 to ADR-0003 fixed the storage engine (Redis 8 Open Source with built-in vector search), the embedding model (`all-MiniLM-L12-v2`, 384-dim) and the runtime (FastAPI + Granian). This ADR defines the algorithm that sits on top of them: for every `POST /v1/chat/completions` request, the gateway must decide whether it may answer from the cache, which stored entry it may use, and what it may store afterwards.
 
 For a cache, a wrong hit is far more expensive than a miss. A miss costs one upstream call (seconds and fractions of a cent). A wrong hit silently serves another question's answer, and the caller has no way to detect it. Six problems make this decision hard:
 
@@ -103,7 +103,7 @@ Three hashes are derived from the canonical form `C`:
 | `param_fp` | SHA-256 of `C` without `messages` | Layer 2 scope |
 
 #### 4.4 Key & Index Schema
-* **Tenant:** `tenant = sha256(api_key)[:16]`. Raw API keys are never stored.
+* **Tenant:** `tenant = sha256(api_key)[:16]`. Raw API keys are never stored. Consequences: rotating an API key starts that caller on an empty cache (old entries expire within one TTL), and two keys belonging to the same organization do not share entries. Mapping keys to a stable organization ID is a later Type 2 change.
 * **Key:** `cache:{schema_version}:{tenant}:{exact_hash}`, e.g. `cache:v1:3f9a…:c41e…`
 * **Index:** `idx:cache:{schema_version}`, created `ON HASH PREFIX cache:{schema_version}:`
 * **Schema version** `v1` = the embedding model **and its exact ONNX file** (`all-MiniLM-L12-v2`, `onnx/model.onnx`; ADR-0002) + the canonicalization rules in §4.3. Changing the embedding model, the ONNX file (e.g. fp32 → qint8), the canonicalization or the denylist requires bumping the version (`CACHE_SCHEMA_VERSION`). Two models with the same dimension (e.g. MiniLM and `bge-small-en`, both 384) would otherwise be mixed silently in one index.
@@ -192,6 +192,7 @@ Redis (`docker-compose.yml`): `maxmemory 2gb`, `maxmemory-policy allkeys-lfu`.
   * [-] **Global threshold is not optimal per entry:** some equivalent paraphrases will miss and some near-boundary pairs will hit wrongly. This is bounded by the 2% error budget, not eliminated.
   * [-] **No request coalescing (thundering herd):** N identical concurrent misses produce N upstream calls until the first write lands. Planned upgrade: in-process single-flight via `asyncio.Future`.
   * [-] **Cold cache after any `v1 → v2` bump,** until entries are rebuilt (up to one TTL period for full turnover).
+  * [-] **Cold cache per tenant after API key rotation,** because the tenant is derived from the key (§4.4).
   * [-] **Up to 7 days of staleness** for time-sensitive answers. Callers can force a refresh with `Cache-Control: no-cache`.
   * [-] **Flat SSE replay:** streamed hits arrive as one chunk, not token by token.
   * [-] **Interface change:** ADR-0001's `BaseVectorCache.check_similarity(vector, threshold)` has no tenant or scope parameters and must be extended (§6).
