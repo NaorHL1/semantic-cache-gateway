@@ -1,0 +1,14 @@
+services:
+  redis:
+    # Pinned per ADR-0001: search and JSON are built into Redis 8 Open Source.
+    image: redis:8.10.2
+    # Eviction per ADR-0004 §4.10. Persistence is an open decision (ADR-0001 §6),
+    # so the image default (RDB snapshots) is kept for now.
+    command: ["redis-server", "--maxmemory", "2gb", "--maxmemory-policy", "allkeys-lfu"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

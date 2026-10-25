@@ -96,18 +96,28 @@ Key architectural trade-offs and structural choices are formally tracked and doc
 
 ---
 
-## 🚀 Quick Start (Coming Soon)
+## 🚀 Quick Start
+
+The project skeleton is in place: configuration, a `/health` route, and request canonicalization (ADR-0004 §4.2–4.4) with tests. The `/v1/chat/completions` route is not implemented yet.
 
 ```bash
 # 1. Clone & enter repository
 git clone https://github.com/NaorHL1/semantic-cache-gateway.git
 cd semantic-cache-gateway
 
-# 2. Launch Redis 8 (vector search built in)
+# 2. Install dependencies and configure
+uv sync
+cp .env.example .env
+
+# 3. Launch Redis 8 (vector search built in)
 docker compose up -d
 
-# 3. Start Gateway (Rust-powered Granian ASGI server)
+# 4. Start Gateway (Rust-powered Granian ASGI server)
 uv run granian --interface asgi src.main:app --reload --port 8000
+
+# 5. Run tests and lint
+uv run pytest
+uv run ruff check . && uv run ruff format --check .
 ```
 
 ### Benchmarks (planned)
