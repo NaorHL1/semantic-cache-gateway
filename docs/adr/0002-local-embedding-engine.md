@@ -71,7 +71,7 @@ The exact `model_file` is part of the cache schema version. fp32 (`model.onnx`) 
   * [+] **Lean Deployment Container:** ONNX Runtime without PyTorch.
 
 * **Bad / Known Trade-offs (Consequences Accepted):**
-  * [-] **Embedding Is the Throughput Ceiling:** At ~7ms of CPU per prompt, one core sustains about **140 Layer 2 lookups per second** (measured: 6.6ms of CPU work → 140 req/s on a single event loop, §6). This, not the HTTP server, bounds gateway throughput on the semantic path, and it scales with cores.
+  * [-] **Embedding Is the Throughput Ceiling:** At ~7ms of CPU per prompt, one core sustains about **140 Layer 2 lookups per second** (estimated from a load test where a 6.6ms NumPy workload stood in for one embedding: 140 req/s on a single event loop, §6; the real MiniLM figure is pending measurement). This, not the HTTP server, bounds gateway throughput on the semantic path, and it scales with cores.
   * [-] **English-Centric Model:** `all-MiniLM-L12-v2` was trained on English data. For other languages, Hebrew included, this is a **correctness** risk, not only a quality one: unrelated non-English prompts may receive high similarity scores and produce false cache hits. Pending measurement (§6).
   * [-] **Sequence Length Limit:** Input is truncated at 256 word pieces, and the model was fine-tuned on sequences of only 128 tokens [3]. Quality beyond 128 tokens is untested. ADR-0004 skips Layer 2 above 256 word pieces.
 

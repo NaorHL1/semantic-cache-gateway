@@ -69,13 +69,13 @@ Gateway throughput is therefore set by upstream latency (misses) and embedding C
 
 ### 6. Mitigation & Reversibility
 * **Thread Offloading for CPU Tasks:** All FastEmbed calls run on a dedicated single-thread executor behind a semaphore (ADR-0002 §6), not on `asyncio.to_thread`. The load test above shows that offloading is required for correctness of the latency SLA, not just for throughput.
-* **Streaming Interceptor:** Upstream SSE is teed by `StreamInterceptor` (planned: `src/semantic_cache_gateway/stream_interceptor.py`). Its storage rules are defined in **ADR-0004 §4.7–4.8**:
+* **Streaming Interceptor:** Upstream SSE will be teed by `StreamInterceptor` (planned: `src/semantic_cache_gateway/stream_interceptor.py`). Its storage rules are defined in **ADR-0004 §4.7–4.8**:
   * Forward bytes immediately, buffering partial SSE events across TCP chunks.
   * Store only after `data: [DONE]` with `finish_reason == "stop"`, no refusal, no tool calls, and recorded usage.
   * Close upstream and store nothing on client disconnect or upstream error.
   * Write to the cache as a background task, never inline.
   
-  These behaviors are to be covered by tests under `tests/`. An earlier prototype with 12 test cases was removed from the repository and will be rewritten in the implementation phase.
+  Each of these behaviors must be covered by tests under `tests/`. An earlier prototype with 12 test cases was removed from the repository and will be rewritten in the implementation phase.
 * **Upstream HTTP client:** decided in **ADR-0005** (aiohttp behind an `UpstreamClient` wrapper; pool, timeouts and retries defined there). The OpenAI Python SDK's default transport (httpx/httpcore) has a documented connection-pool scaling problem at high concurrency [3], which is one reason httpx was not chosen.
 * **Reversibility (Type 2 Decision):** The gateway is a standard ASGI app (`app = FastAPI()`), so the server can be swapped with one command (`granian --interface asgi semantic_cache_gateway.main:app` ↔ `uvicorn semantic_cache_gateway.main:app`) without changing application code.
 
