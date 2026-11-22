@@ -92,7 +92,25 @@ class BaseEmbeddingEngine(ABC):
         """Generate a normalized dense vector for a query string."""
 ```
 
-* **Mandatory Thread Offloading (correctness, not optimization):** Every FastEmbed call runs via `asyncio.to_thread`. ONNX Runtime releases the GIL during inference, so offloading keeps the event loop free. In a local load test with a 6.6ms CPU workload at 32 concurrent requests, a trivial request issued alongside waited **p50 220ms** when the work ran on the event loop, versus **p50 2.6ms** when it was offloaded. Without offloading, one embedding blocks every sub-millisecond Layer 1 hit.
+* **Mandatory Thread Offloading (correctness, not optimization):** Every FastEmbed call runs on a dedicated single-thread executor (`ThreadPoolExecutor(max_workers=1)`), and an `asyncio.Semaphore` bounds the number of embeddings in flight (queued or running). `asyncio.to_thread` is not used: it draws from the default pool (up to `min(32, cpu+4)` threads), so several ONNX inferences would run in parallel on the same cores. ONNX Runtime releases the GIL during inference, so offloading keeps the event loop free. In a local load test with a 6.6ms CPU workload at 32 concurrent requests, a trivial request issued alongside waited **p50 220ms** when the work ran on the event loop, versus **p50 2.6ms** when it was offloaded via `to_thread`. The dedicated-executor variant is pending measurement. Without offloading, one embedding blocks every sub-millisecond Layer 1 hit.
+
+  ```python
+  _embed_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
+  _embed_slots = asyncio.Semaphore(settings.EMBED_MAX_INFLIGHT)  # assume 4
+
+  async def embed_or_skip(text: str, timeout_s: float) -> list[float] | None:
+      if _embed_slots.locked():
+          return None
+      await _embed_slots.acquire()
+      loop = asyncio.get_running_loop()
+      cf = _embed_pool.submit(_embed_sync, text)
+      # Release when the job really ends, not when the caller stops waiting.
+      cf.add_done_callback(lambda _: loop.call_soon_threadsafe(_embed_slots.release))
+      try:
+          return await asyncio.wait_for(asyncio.wrap_future(cf), timeout_s)
+      except asyncio.TimeoutError:
+          return None
+  ```
 * **CPU Oversubscription:** Each worker creates its ONNX session with `threads=1`, so `workers × ONNX threads ≤ cores`.
 * **Pending measurements (planned scripts under `benchmarks/`, added in the evaluation phase):**
   * `threshold_sweep.py --models L6 L12`: hit rate and error rate per threshold on SemBenchmarkLmArena for both models, plus per-prompt embedding time on target hardware. The model that reaches the higher hit rate within the 2% error budget is selected. If they are tied, L6 wins, being twice as fast and built into FastEmbed.

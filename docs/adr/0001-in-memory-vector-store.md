@@ -50,13 +50,13 @@ HNSW is approximate: with `EF_RUNTIME=10` it can occasionally miss the true near
 
 * **Bad / Known Trade-offs (Consequences Accepted):**
   * [-] **Single-Threaded Command Execution:** Command processing is bound to a single CPU core, requiring cluster sharding if vertical single-core limits are exceeded.
-  * [-] **Persistence vs. Memory:** Fork-based snapshotting (`BGSAVE`) can temporarily raise memory use. See the open decision in §6.
+  * [-] **Persistence vs. Memory:** Fork-based snapshotting (`BGSAVE`) can temporarily raise memory use. Resolved by disabling persistence (§6).
   * [-] **Licensing:** Redis 8 is offered under RSALv2, SSPLv1 or AGPLv3. None of these restrict self-hosting the unmodified server inside this gateway; they matter only if the database itself were offered as a managed service. Valkey (BSD-3) would be simpler on this point.
 
 ### 6. Mitigation & Reversibility
 * **Encapsulation via Interface Contract:** Direct Redis calls never leak into the FastAPI routing layer. The original `check_similarity(vector, threshold)` contract has no tenant or scope parameters and is **superseded by the `BaseVectorCache` interface in ADR-0004 §6** (`get_exact`, `search_similar`, `store`).
 * **Client library path:** use `redisvl.extensions.cache.llm` (or the lower-level `redisvl.index.SearchIndex`). Importing from `redisvl.extensions.llmcache` is deprecated [4].
-* **Open decision: persistence (Type 2).** A cache can run without persistence (`save ""`, `appendonly no`). That removes `BGSAVE` memory spikes and disk I/O, at the cost of an empty cache after a restart. To be decided; the default Redis configuration keeps RDB snapshots.
+* **Decision: no persistence (Type 2, 2026-11-22).** Redis runs with `--save ""` and `--appendonly no` (set in `docker-compose.yml`). The cache is reconstructible from the upstream, and the Redis persistence documentation notes that disabling persistence is sometimes used when caching [6]. This removes the `BGSAVE` fork (which the same documentation says can stop Redis from serving clients for milliseconds, or up to a second on a very large dataset), the extra memory a fork can need (copy-on-write), and the AOF buffers that `maxmemory` does not count [7]. The cost is a cold cache after every restart. Size is bounded by `maxmemory 2gb`, `allkeys-lfu` eviction and the fixed 7-day TTL (ADR-0004 §4.10). Because the index is not assumed to survive a restart, the gateway checks for the index at startup (`FT.INFO`) and creates it if missing. To change this, edit the Redis flags in `docker-compose.yml`; no code change is needed. If measurements show the cold start hurts, RDB snapshots are the first alternative.
 * **Reversibility (Type 2 Decision):** Valkey and Dragonfly speak the same RESP protocol, but their search commands are not verified against `redisvl`. Migrating means implementing a new `BaseVectorCache` adapter and validating it against the ADR-0004 test suite, with zero changes to gateway logic or routing endpoints.
 
 ### 7. References
@@ -65,3 +65,5 @@ HNSW is approximate: with `EF_RUNTIME=10` it can occasionally miss the true near
 3. **Valkey.** *valkey-bundle: One stop shop for real-time applications* (2025-06-23). [valkey.io/blog](https://valkey.io/blog/valkey-bundle-one-stop-shop-for-low-latency-modern-applications/)
 4. **RedisVL source, v0.28.0.** `redisvl/schema/fields.py` (HNSW defaults), `redisvl/extensions/llmcache/__init__.py` (deprecation). [github.com/redis/redis-vl-python](https://github.com/redis/redis-vl-python)
 5. **Redis.** *Vector search: HNSW index parameters.* [redis.io/docs/latest/develop/ai/search-and-query/vectors](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/)
+6. **Redis.** *Redis persistence* (disabling persistence, RDB fork behavior). [redis.io/docs/latest/operate/oss_and_stack/management/persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+7. **Redis.** *Key eviction* (`maxmemory` does not count replication and AOF buffers). [redis.io/docs/latest/develop/reference/eviction](https://redis.io/docs/latest/develop/reference/eviction/)

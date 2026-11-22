@@ -70,7 +70,7 @@ Option 3.1-C gives sub-millisecond exact hits without duplicating responses, and
       ▼
  5. Embed last user message ─► KNN(k=1) filtered by @tenant + @scope
       │
-      ├── distance ≤ 1 − τ and completion_tokens ≤ max_tokens ──────► HIT-SEMANTIC
+      ├── distance ≤ max(1 − τ, 1e-6) and completion_tokens ≤ max_tokens ──────► HIT-SEMANTIC
       │
       └── otherwise ─► Upstream (stream to client) ─► Write-Path Filter ─► Store (background)
 ```
@@ -86,7 +86,7 @@ The request bypasses both layers (`X-Cache-Status: BYPASS`) if any of the follow
 #### 4.3 Canonicalization & Parameter Fingerprint
 One canonicalization function serves both layers:
 1. Parse the JSON body.
-2. Fill provider defaults for absent fields (`temperature=1.0`, `top_p=1.0`, `n=1`, `presence_penalty=0`, `frequency_penalty=0`), so an omitted field and its explicit default hash identically.
+2. Fill provider defaults for absent fields, **only for upstreams whose defaults are verified** (OpenAI: `temperature=1.0`, `top_p=1.0`, `n=1`, `presence_penalty=0`, `frequency_penalty=0`), so an omitted field and its explicit default hash identically. For any other upstream (e.g. vLLM, which may apply the model's own `generation_config`), an absent field stays absent in the canonical form. Omitted and explicit values are not known to be equal there, so they must not collide.
 3. Round `temperature` and `top_p` to 2 decimals.
 4. Remove the **exclusion denylist**: `stream`, `stream_options`, `user`, `metadata`, `store`, `max_tokens`, `max_completion_tokens`.
 5. **Conditional seed rule:** if `temperature == 0.0`, decoding is greedy and the seed has no effect, so `seed` is removed. Otherwise `seed` is kept.
@@ -104,6 +104,8 @@ Three hashes are derived from the canonical form `C`:
 
 #### 4.4 Key & Index Schema
 * **Tenant:** `tenant = sha256(api_key)[:16]`. Raw API keys are never stored.
+* **Partition:** optional `X-Cache-Partition` header, folded into `scope` (table below). Empty means the shared tenant cache. The calling application sets it, not the end user, and the value must be an opaque, application-issued identifier. A guessable value (e.g. a plain user ID that an attacker can enumerate) lets one user read another user's hits.
+* **Client decoding:** the Redis connection uses `decode_responses=False`. The `embedding` field is raw FLOAT32 bytes and is never decoded as text. String fields (`tenant`, `scope`, `response`) are decoded explicitly in the adapter.
 * **Key:** `cache:{schema_version}:{tenant}:{exact_hash}`, e.g. `cache:v1:3f9a…:c41e…`
 * **Index:** `idx:cache:{schema_version}`, created `ON HASH PREFIX cache:{schema_version}:`
 * **Schema version** `v1` = the embedding model **and its exact ONNX file** (`all-MiniLM-L12-v2`, `onnx/model.onnx`; ADR-0002) + the canonicalization rules in §4.3. Changing the embedding model, the ONNX file (e.g. fp32 → qint8), the canonicalization or the denylist requires bumping the version (`CACHE_SCHEMA_VERSION`). Two models with the same dimension (e.g. MiniLM and `bge-small-en`, both 384) would otherwise be mixed silently in one index.
@@ -111,7 +113,7 @@ Three hashes are derived from the canonical form `C`:
 | Field | Type | Purpose |
 |---|---|---|
 | `tenant` | TAG | Isolation filter; per-tenant deletion and metrics |
-| `scope` | TAG | `sha256(context_hash \| param_fp)`; Layer 2 filter |
+| `scope` | TAG | `sha256(context_hash \| param_fp \| partition)`; Layer 2 filter |
 | `embedding` | VECTOR (HNSW, FLOAT32, 384, COSINE) | Layer 2 search; absent for entries not eligible for Layer 2 |
 | `response` | TEXT (not indexed) | Normalized response record (§4.8) |
 | `completion_tokens` | NUMERIC | `max_tokens` check at read time |
@@ -123,7 +125,7 @@ Three hashes are derived from the canonical form `C`:
 #### 4.6 Layer 2: Semantic Match
 * **Eligibility:** the last message must have role `user` with text content of at most 256 word pieces (the MiniLM truncation limit). Otherwise Layer 2 is skipped and Layer 1 alone applies. This covers, for example, a final answer that follows a tool result, whose last message has role `tool`.
 * **Embedded text:** only the last user message. All earlier context (system prompt, prior turns, tool results) must match exactly through `context_hash`, so a follow-up can only match follow-ups to an identical conversation.
-* **Query:** KNN with `k=1`, filtered by `@tenant:{t} @scope:{s}`. A hit requires Redis COSINE distance `≤ 1 − τ` (0–2 scale; τ = 0.94 → distance ≤ 0.06) and `completion_tokens ≤ request.max_tokens`.
+* **Query:** KNN with `k=1`, filtered by `@tenant:{t} @scope:{s}`. A hit requires Redis COSINE distance `≤ max(1 − τ, 1e-6)` (0–2 scale; τ = 0.94 → distance ≤ 0.06) and `completion_tokens ≤ request.max_tokens`. The `1e-6` floor keeps τ = 1.00 from rejecting identical strings, since float32 rounding can leave a tiny non-zero distance between identical vectors.
 
 #### 4.7 Write-Path Filter
 A response is stored only if all of the following hold:
@@ -141,7 +143,7 @@ Responses with `finish_reason` of `length` (truncated), `content_filter` (blocke
 * **Client disconnect:** the upstream connection is cancelled immediately and nothing is stored. A user pressing "Stop" is often rejecting the answer, and continuing to read would also let a caller run up full-length upstream costs by opening and abandoning requests.
 
 #### 4.9 Threshold Policy
-* **Default:** τ = 0.94 (`CACHE_SIMILARITY_THRESHOLD`), provisional until §7 is run. After calibration, τ becomes the **lowest threshold whose measured error rate is ≤ 2%**.
+* **Default:** τ = 0.94 (`CACHE_SIMILARITY_THRESHOLD`), provisional until §7 is run. After calibration, τ becomes the **lowest threshold whose measured error rate is ≤ 2%** on the calibration half, at the worst of 5 seeds (§7).
 * **Per-request override:** `X-Cache-Threshold` can only tighten matching: `τ_effective = clamp(max(τ_default, header), ≤ 1.0)`. Loosening is refused, because applications often forward client headers, which would let end users degrade answer quality and bypass the calibrated value.
 
 #### 4.10 TTL & Eviction
@@ -150,7 +152,7 @@ Responses with `finish_reason` of `length` (truncated), `content_filter` (blocke
 * **Memory estimate:** about 4KB per entry (1.5KB vector + HNSW links + ~1.5KB average response + fields), so roughly 500k entries per 2GB. ADR-0002's 1.5GB per 1M figure counts vectors only.
 
 #### 4.11 Failure Handling (fail-open on availability)
-The whole lookup path (Layer 1 + embedding + Layer 2) runs under `CACHE_LOOKUP_TIMEOUT_MS=50`. Any Redis error or timeout is treated as a miss: the request goes upstream and the response carries `X-Cache-Status: ERROR`. This does not contradict §4.3. The fingerprint is fail-closed on **correctness** (when unsure, do not serve from the cache); this rule is fail-open on **availability** (when the cache is down, serve from the source). Neither ever serves a wrong answer.
+The whole lookup path (Layer 1 + embedding + Layer 2) runs under `CACHE_LOOKUP_TIMEOUT_MS=50`. The timeout cancels only the wait: an embedding already running keeps its executor slot until it finishes (ADR-0002 §6). When the embedding semaphore is exhausted, Layer 2 is skipped at once, without waiting. Any Redis error or timeout is treated as a miss: the request goes upstream and the response carries `X-Cache-Status: ERROR`. This does not contradict §4.3. The fingerprint is fail-closed on **correctness** (when unsure, do not serve from the cache); this rule is fail-open on **availability** (when the cache is down, serve from the source). Neither ever serves a wrong answer.
 
 #### 4.12 Response & Request Headers
 | Header | Direction | Behavior |
@@ -175,6 +177,20 @@ The similarity score is hidden by default because key-collision attacks refine a
 | `CACHE_DEBUG_HEADERS` | `false` |
 
 Redis (`docker-compose.yml`): `maxmemory 2gb`, `maxmemory-policy allkeys-lfu`.
+
+#### 4.14 Planned Extension: Shadow Verification (measurement first)
+**Status:** direction chosen 2026-11-22; not yet designed or implemented.
+
+**Idea.** A small sample of cache hits is also sent to the upstream in the background (a *shadow call*). The stored answer is compared with the fresh one, giving a live **wrong-hit rate per tenant**. The result is exported as a metric (OpenTelemetry) and can gate CI, so the 2% error budget of §7 becomes a measured and enforced property instead of a one-time calibration. The user never waits for the shadow call.
+
+**Phases.**
+1. **Measurement only (Type 2).** Sample, compare, record. No change to cache behavior.
+2. **Automatic tightening (Type 1, future ADR).** When a tenant's measured rate exceeds the budget, raise that tenant's threshold. This adds per-tenant state. It is related to, but not the same as, Option 3.3-C (per-entry thresholds), which this ADR did not choose.
+
+**Open decisions (not settled here):**
+* What counts as a "wrong hit": exact comparison when `temperature == 0`, versus an LLM or embedding judge otherwise. The accuracy of such a judge has not been evaluated.
+* Sample rate, and how the extra upstream cost is accounted for and capped.
+* Per-tenant sample size needed before a rate is trusted.
 
 ### 5. Pros & Cons of the Chosen Option
 
@@ -237,6 +253,8 @@ class BaseVectorCache(ABC):
 | Tools allowed, debug headers, lookup timeout | Type 2 | `.env` |
 | Request coalescing | Type 2 | Add single-flight; no schema change |
 | Adaptive per-entry thresholds | Type 1 | Future ADR; adds per-entry state |
+| Shadow verification, measurement only (§4.14) | Type 2 | Sampling flag in `.env`; no change to cache behavior |
+| Automatic per-tenant threshold tightening (§4.14) | Type 1 | Future ADR; adds per-tenant state |
 
 * **Note on Type 1 cost:** because every entry expires within 7 days, a Type 1 change never requires a data migration. Its cost is a cold cache during turnover, and the version prefix guarantees old and new entries never mix.
 
@@ -245,27 +263,29 @@ The provisional τ = 0.94 is replaced by a measured value before the first relea
 
 * **Dataset:** `vCache/SemBenchmarkLmArena` [6] (Apache-2.0). 51,147 chat prompts in 3,500 groups (`ID_Set`), each group being one original LM-Arena prompt plus 1–23 paraphrases generated by GPT-4.1-nano. Only the `prompt` and `ID_Set` columns are used. The shipped precomputed embeddings do not include MiniLM, so embeddings are computed locally (about 51k × ~7ms ≈ 6 min on CPU).
 * **Protocol (sequential replay, reproducible):**
-  1. Shuffle once with a fixed seed.
-  2. For each prompt in order: find the nearest cached neighbor (k=1). If similarity ≥ τ, record a hit, which is correct when the neighbor's `ID_Set` equals the prompt's. Otherwise record a miss and insert the prompt.
-  3. Repeat for each τ in **{1.00, 0.99, 0.98, 0.97, 0.95, 0.94, 0.92, 0.89, 0.86, 0.80}**.
-  4. Repeat for both `all-MiniLM-L6-v2` and `all-MiniLM-L12-v2`. The model with the higher hit rate within the error budget is adopted (ADR-0002 §6); if they tie, L6 is adopted for its lower CPU cost.
-* **Metrics:** **Hit rate** = hits / all requests. **Error rate** = wrong hits / all requests (vCache's definition, for comparability).
-* **Selection rule:** production τ = the lowest τ with error rate ≤ 2%. If it falls between two rows, that one value is added to the table.
+  1. **Split by group, not by row.** Partition the 3,500 `ID_Set` groups with a fixed seed into half A (calibration) and half B (held-out). All paraphrases of one prompt stay on the same side, so the held-out set cannot leak into calibration.
+  2. Shuffle each half with **5 fixed seeds**. Keep the per-seed results; never average them away.
+  3. For each prompt in order: find the nearest cached neighbor (k=1) within the same replay's cache. If `distance ≤ max(1 − τ, 1e-6)`, record a hit, which is correct when the neighbor's `ID_Set` equals the prompt's. Otherwise record a miss and insert the prompt.
+  4. Repeat for each τ in **{1.00, 0.99, 0.98, 0.97, 0.95, 0.94, 0.92, 0.89, 0.86, 0.80}**.
+  5. Repeat for both `all-MiniLM-L6-v2` and `all-MiniLM-L12-v2`, on half A only. The model with the higher hit rate within the error budget is adopted (ADR-0002 §6); if they tie, L6 is adopted for its lower CPU cost.
+  6. Report the chosen configuration on **half B**, once, after τ and the model are fixed.
+* **Metrics:** **Hit rate** = hits / all requests. **Error rate** = wrong hits / all requests (vCache's definition, for comparability). **Precision** = correct hits / hits. It is the share of served hits that were right, which is what a user actually experiences. At a 40% hit rate, a 2% error rate means about 5% of served hits are wrong, so report precision alongside error rate. Report all three per seed, for both halves.
+* **Selection rule:** production τ = the lowest τ whose error rate is ≤ 2% on half A for **every** one of the 5 seeds (worst seed). If it falls between two rows, that one value is added to the table. Half B is reported once, after τ is fixed.
 * **Reference points:** τ = 1.00 approximates Layer 1 alone. The theoretical ceiling is ≈ 93% ((51,147 − 3,500) / 51,147), since the first prompt of each group must miss.
-* **Artifacts:** `benchmarks/threshold_sweep.py` (`--models L6 L12`); results table in the README:
+* **Artifacts:** `benchmarks/threshold_sweep.py` (planned; `--models L6 L12`); results table in the README:
 
-| Threshold | Hit Rate | Error Rate |
-|---|---|---|
-| 1.00 | TBD | TBD |
-| 0.99 | TBD | TBD |
-| 0.98 | TBD | TBD |
-| 0.97 | TBD | TBD |
-| 0.95 | TBD | TBD |
-| 0.94 | TBD | TBD |
-| 0.92 | TBD | TBD |
-| 0.89 | TBD | TBD |
-| 0.86 | TBD | TBD |
-| 0.80 | TBD | TBD |
+| Threshold | Hit Rate | Error Rate | Precision |
+|---|---|---|---|
+| 1.00 | TBD | TBD | TBD |
+| 0.99 | TBD | TBD | TBD |
+| 0.98 | TBD | TBD | TBD |
+| 0.97 | TBD | TBD | TBD |
+| 0.95 | TBD | TBD | TBD |
+| 0.94 | TBD | TBD | TBD |
+| 0.92 | TBD | TBD | TBD |
+| 0.89 | TBD | TBD | TBD |
+| 0.86 | TBD | TBD | TBD |
+| 0.80 | TBD | TBD | TBD |
 
 * **Limitations:**
   * The paraphrases are LLM-generated and cleaner than real traffic, so the result is an estimate that should be re-checked against production logs.

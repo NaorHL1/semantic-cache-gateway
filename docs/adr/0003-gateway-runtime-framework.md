@@ -68,20 +68,20 @@ Gateway throughput is therefore set by upstream latency (misses) and embedding C
   * [-] **Small Real-World Gain:** On this workload the measured advantage over Uvicorn is small. The choice is low-risk because it is fully reversible.
 
 ### 6. Mitigation & Reversibility
-* **Thread Offloading for CPU Tasks:** All FastEmbed calls run via `asyncio.to_thread` (ADR-0002 §6). The load test above shows this is required for correctness of the latency SLA, not just for throughput.
-* **Streaming Interceptor:** Upstream SSE is teed by `StreamInterceptor` (`src/gateway/stream_interceptor.py`). Its storage rules are defined in **ADR-0004 §4.7–4.8**:
+* **Thread Offloading for CPU Tasks:** All FastEmbed calls run on a dedicated single-thread executor behind a semaphore (ADR-0002 §6), not on `asyncio.to_thread`. The load test above shows that offloading is required for correctness of the latency SLA, not just for throughput.
+* **Streaming Interceptor:** Upstream SSE is teed by `StreamInterceptor` (planned: `src/semantic_cache_gateway/stream_interceptor.py`). Its storage rules are defined in **ADR-0004 §4.7–4.8**:
   * Forward bytes immediately, buffering partial SSE events across TCP chunks.
   * Store only after `data: [DONE]` with `finish_reason == "stop"`, no refusal, no tool calls, and recorded usage.
   * Close upstream and store nothing on client disconnect or upstream error.
   * Write to the cache as a background task, never inline.
   
-  These behaviors are covered by `tests/test_stream_interceptor.py` (12 cases).
-* **Open dependency:** The upstream HTTP client (library, connection pool, timeouts, retries) is not decided here and will be covered by ADR-0005. Note that the OpenAI Python SDK's default transport (httpx/httpcore) has a documented connection-pool scaling problem at high concurrency [3].
-* **Reversibility (Type 2 Decision):** The gateway is a standard ASGI app (`app = FastAPI()`), so the server can be swapped with one command (`granian --interface asgi src.main:app` ↔ `uvicorn src.main:app`) without changing application code.
+  These behaviors are to be covered by tests under `tests/`. An earlier prototype with 12 test cases was removed from the repository and will be rewritten in the implementation phase.
+* **Upstream HTTP client:** decided in **ADR-0005** (aiohttp behind an `UpstreamClient` wrapper; pool, timeouts and retries defined there). The OpenAI Python SDK's default transport (httpx/httpcore) has a documented connection-pool scaling problem at high concurrency [3], which is one reason httpx was not chosen.
+* **Reversibility (Type 2 Decision):** The gateway is a standard ASGI app (`app = FastAPI()`), so the server can be swapped with one command (`granian --interface asgi semantic_cache_gateway.main:app` ↔ `uvicorn semantic_cache_gateway.main:app`) without changing application code.
 
 ### 7. References & Benchmarks
 1. **Granian benchmarks: comparison with other servers.** Run 2026-08-05. [github.com/emmett-framework/granian/blob/master/benchmarks/vs.md](https://github.com/emmett-framework/granian/blob/master/benchmarks/vs.md)
-2. **Local gateway-shaped load test.** `benchmarks/server_load/` (`app.py`, `load.py`). Uvicorn 0.53, Python 3.13, 2 CPUs, 6.6ms single-threaded NumPy workload standing in for one embedding.
+2. **Local gateway-shaped load test.** `benchmarks/server_load/` (`app.py`, `load.py`; the scripts were removed from the repository, the measurements are kept here as the record and will be re-run under `benchmarks/`). Uvicorn 0.53, Python 3.13, 2 CPUs, 6.6ms single-threaded NumPy workload standing in for one embedding.
 3. **NVIDIA NeMo Gym.** *Engineering notes: aiohttp vs httpx* (httpcore connection pool is O(n²); a 16,000-request rollout hung for 40 minutes). [docs.nvidia.com/nemo/gym](https://docs.nvidia.com/nemo/gym/infrastructure/engineering-notes/aiohttp-vs-httpx)
 4. **FastAPI documentation.** [fastapi.tiangolo.com](https://fastapi.tiangolo.com)
 5. **Granian.** [github.com/emmett-framework/granian](https://github.com/emmett-framework/granian)
